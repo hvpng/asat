@@ -1,0 +1,32 @@
+# configs/base.yaml
+# Hyperparameters dùng chung cho tất cả experiments
+
+model:
+  name: "bert-base-uncased"        # hoặc "roberta-base" cho ablation
+  num_labels: 2                    # binary sentiment
+  max_seq_length: 128              # SST-2 câu ngắn, 128 là đủ; IMDB cần 512
+
+training:
+  num_epochs: 3
+  per_device_train_batch_size: 16
+  per_device_eval_batch_size: 32
+  learning_rate: 2.0e-5
+  warmup_ratio: 0.1                # 10% steps đầu warmup LR
+  weight_decay: 0.01
+  max_grad_norm: 1.0               # gradient clipping
+  seed: 42                         # đổi sang 123, 456 cho multi-seed runs
+
+data:
+  dataset_name: "glue"
+  dataset_config: "sst2"           # hoặc "imdb", "yelp_polarity"
+  text_column: "sentence"          # SST-2 dùng "sentence"; IMDB dùng "text"
+  label_column: "label"
+
+logging:
+  wandb_project: "asat-research"
+  log_every_n_steps: 50
+  eval_every_n_epochs: 1
+
+output:
+  checkpoint_dir: "checkpoints"
+  results_dir: "results"
