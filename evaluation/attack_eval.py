@@ -70,6 +70,9 @@ def run_attack(attack_name, model, tokenizer, dataset_name, n_samples, seed):
     Trả về list of dict:
         { original_text, attacked_text, label, pred_flipped }
     """
+    import nltk
+    nltk.download("averaged_perceptron_tagger_eng", quiet=True)
+
     from textattack import Attacker, AttackArgs
     from textattack.datasets import HuggingFaceDataset
     from textattack.models.wrappers import HuggingFaceModelWrapper
@@ -148,7 +151,7 @@ def save_heatmap(tokens_c, attr_c, tokens_a, attr_a,
     _draw(axes[0], tokens_c, attr_c, "CLEAN",    "#1a73e8")
     _draw(axes[1], tokens_a, attr_a, "ATTACKED", "#e53935")
 
-    status = "FLIPPED " if pred_flipped else f"stable | ρ={rho:.3f}"
+    status = "FLIPPED ⚠" if pred_flipped else f"stable | ρ={rho:.3f}"
     fig.suptitle(f"[{idx}] label={label} | {status}", fontsize=9, fontweight="bold")
     plt.tight_layout()
 
