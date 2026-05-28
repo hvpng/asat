@@ -1,6 +1,7 @@
 # training/train_standard.py
 # Standard BERT fine-tuning baseline (no adversarial training).
 # Usage: python training/train_standard.py --dataset sst2 --seed 42
+# Resume: python training/train_standard.py --dataset sst2 --seed 42 --resume
 
 import argparse
 import os
@@ -18,15 +19,14 @@ from transformers import (
 from torch.optim import AdamW
 from sklearn.metrics import accuracy_score
 
-# Add project root to sys.path so "data.load_data" is importable
-# Works whether you run as: python training/train_standard.py
-# or from project root: python -m training.train_standard
 _this_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
 _root = os.path.dirname(_this_dir) if os.path.basename(_this_dir) == "training" else _this_dir
 if _root not in sys.path:
     sys.path.insert(0, _root)
 
 from data.load_data import load_and_tokenize
+
+RESUME_STATE_FILE = "training_state.pt"
 
 
 def parse_args():
@@ -45,6 +45,9 @@ def parse_args():
     parser.add_argument("--train_subset",  type=int,   default=None)
     parser.add_argument("--output_dir",    type=str,   default="checkpoints/standard")
     parser.add_argument("--no_wandb",      action="store_true")
+    # Resume: load model weights + optimizer/scheduler state from output_dir
+    parser.add_argument("--resume",        action="store_true",
+                        help="Resume from last checkpoint in --output_dir")
     return parser.parse_args()
 
 
@@ -70,6 +73,43 @@ def evaluate(model, dataloader, device):
     return acc, all_preds, all_labels
 
 
+def save_training_state(output_dir, optimizer, scheduler, epoch, best_val_acc):
+    """Save optimizer/scheduler state after each epoch for exact resume."""
+    state = {
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "last_completed_epoch": epoch,   # 0-indexed
+        "best_val_acc": best_val_acc,
+    }
+    path = os.path.join(output_dir, RESUME_STATE_FILE)
+    torch.save(state, path)
+    print(f"  [resume] State saved → {path}", flush=True)
+
+
+def load_training_state(output_dir, optimizer, scheduler):
+    """
+    Restore optimizer/scheduler state.
+    Returns (start_epoch, best_val_acc).
+    start_epoch is the NEXT epoch to run (last_completed + 1).
+    """
+    path = os.path.join(output_dir, RESUME_STATE_FILE)
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"No training state at {path}. Run without --resume to start fresh."
+        )
+    state = torch.load(path, map_location="cpu")
+    optimizer.load_state_dict(state["optimizer_state_dict"])
+    scheduler.load_state_dict(state["scheduler_state_dict"])
+    start_epoch  = state["last_completed_epoch"] + 1
+    best_val_acc = state["best_val_acc"]
+    print(
+        f"  [resume] Loaded from {path}\n"
+        f"  [resume] Next epoch = {start_epoch + 1} | best_val_acc = {best_val_acc:.4f}",
+        flush=True,
+    )
+    return start_epoch, best_val_acc
+
+
 def train(args):
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -81,9 +121,9 @@ def train(args):
             project="asat-research",
             name=f"standard_{args.dataset}_seed{args.seed}",
             config=vars(args),
+            resume="allow",
         )
 
-    # Load data
     splits, tokenizer = load_and_tokenize(
         args.dataset,
         tokenizer_name=args.model_name,
@@ -93,23 +133,39 @@ def train(args):
     train_loader = DataLoader(splits["train"], batch_size=args.batch_size, shuffle=True)
     val_loader   = DataLoader(splits["val"],   batch_size=args.batch_size * 2)
 
-    # Model
-    model = AutoModelForSequenceClassification.from_pretrained(
-        args.model_name, num_labels=2
-    ).to(device)
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    # Optimizer + scheduler
+    # Load model weights from checkpoint if resuming, else load pretrained
+    if args.resume and os.path.exists(os.path.join(args.output_dir, "config.json")):
+        print(f"  [resume] Loading model from {args.output_dir}", flush=True)
+        model = AutoModelForSequenceClassification.from_pretrained(args.output_dir).to(device)
+    else:
+        model = AutoModelForSequenceClassification.from_pretrained(
+            args.model_name, num_labels=2
+        ).to(device)
+
     optimizer    = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # Scheduler must be built with total_steps = full num_epochs (not remaining epochs)
+    # so LR schedule stays consistent whether starting fresh or resuming
     total_steps  = len(train_loader) * args.num_epochs
     warmup_steps = int(total_steps * args.warmup_ratio)
     scheduler    = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
     )
 
+    start_epoch  = 0
     best_val_acc = 0.0
-    os.makedirs(args.output_dir, exist_ok=True)
+    if args.resume:
+        start_epoch, best_val_acc = load_training_state(args.output_dir, optimizer, scheduler)
+        if start_epoch >= args.num_epochs:
+            print(
+                f"Already completed {args.num_epochs} epoch(s). "
+                "Increase --num_epochs to continue.",
+                flush=True,
+            )
+            return best_val_acc
 
-    for epoch in range(args.num_epochs):
+    for epoch in range(start_epoch, args.num_epochs):
         model.train()
         total_loss = 0.0
 
@@ -142,7 +198,6 @@ def train(args):
                     flush=True,
                 )
 
-        # Eval after each epoch
         val_acc, _, _ = evaluate(model, val_loader, device)
         avg_loss = total_loss / len(train_loader)
 
@@ -160,9 +215,11 @@ def train(args):
             best_val_acc = val_acc
             model.save_pretrained(args.output_dir)
             tokenizer.save_pretrained(args.output_dir)
-            print(f"Saved best model  val_acc={val_acc:.4f}", flush=True)
+            print(f"  Saved best model  val_acc={val_acc:.4f}", flush=True)
 
-    # Save results JSON
+        # Save training state every epoch (overwrites; only need the last one)
+        save_training_state(args.output_dir, optimizer, scheduler, epoch, best_val_acc)
+
     os.makedirs("results", exist_ok=True)
     path = f"results/standard_{args.dataset}_seed{args.seed}.json"
     with open(path, "w") as f:

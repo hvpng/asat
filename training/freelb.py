@@ -2,17 +2,13 @@
 # FreeLB: Enhanced Adversarial Training for NLP
 # Zhu et al., ICLR 2020 - https://arxiv.org/abs/1902.03932
 #
-# Core idea: find worst-case perturbation delta in embedding space
-# via K steps of gradient ascent, then minimize loss on perturbed input.
-# Gradients are ACCUMULATED across K steps (not just the final step).
-#
 # Usage: python training/freelb.py --dataset sst2 --seed 42
+# Resume: python training/freelb.py --dataset sst2 --seed 42 --resume
 
 import argparse
 import os
 import json
 import torch
-import wandb
 import numpy as np
 
 from torch.utils.data import DataLoader
@@ -28,6 +24,8 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data.load_data import load_and_tokenize
 
+RESUME_STATE_FILE = "training_state.pt"
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="FreeLB adversarial training")
@@ -42,18 +40,15 @@ def parse_args():
     parser.add_argument("--weight_decay",  type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--seed",          type=int,   default=42)
-    # FreeLB hyperparameters
-    parser.add_argument("--freelb_k",     type=int,   default=3,
-                        help="Number of gradient ascent steps to find worst-case delta")
-    parser.add_argument("--freelb_eps",   type=float, default=1e-6,
-                        help="Frobenius ball radius - max norm of delta")
-    parser.add_argument("--freelb_alpha", type=float, default=3e-1,
-                        help="Step size for each gradient ascent step")
-    parser.add_argument("--lambda1",      type=float, default=1.0,
-                        help="Weight of L_adv in joint loss")
+    parser.add_argument("--freelb_k",     type=int,   default=3)
+    parser.add_argument("--freelb_eps",   type=float, default=1e-6)
+    parser.add_argument("--freelb_alpha", type=float, default=3e-1)
+    parser.add_argument("--lambda1",      type=float, default=1.0)
     parser.add_argument("--train_subset", type=int,   default=None)
     parser.add_argument("--output_dir",   type=str,   default="checkpoints/freelb")
     parser.add_argument("--no_wandb",     action="store_true")
+    parser.add_argument("--resume",       action="store_true",
+                        help="Resume from last checkpoint in --output_dir")
     return parser.parse_args()
 
 
@@ -79,9 +74,6 @@ def evaluate(model, dataloader, device):
 
 
 def get_word_embeddings(model):
-    """
-    Support both BERT and RoBERTa architectures
-    """
     if hasattr(model, 'bert'):
         return model.bert.embeddings.word_embeddings
     elif hasattr(model, 'roberta'):
@@ -93,60 +85,69 @@ def get_word_embeddings(model):
 def freelb_step(model, batch, device, args):
     """
     One FreeLB training step.
-
-    Steps:
-    1. Get clean input embeddings
-    2. Init delta = 0
-    3. K gradient ascent steps to find worst-case delta
-    4. Accumulate gradients into model params theta across all K steps
-    5. Return total loss for logging
-
-    Key design: gradients are ACCUMULATED (not reset) across K steps.
-    This gives more diverse adversarial signal than using only the final step.
+    Gradients are accumulated into theta across all K ascent steps.
     """
     input_ids      = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
     labels         = batch["label"].to(device)
 
-    # Get clean embeddings and detach from model graph
-    # delta will be a separate variable from theta
     embedding_layer = get_word_embeddings(model)
-    embeddings = embedding_layer(input_ids).detach()  # [batch, seq_len, hidden]
+    embeddings = embedding_layer(input_ids).detach()
 
-    # Init delta = 0
     delta = torch.zeros_like(embeddings, requires_grad=True)
-
     total_loss = 0.0
 
     for step_k in range(args.freelb_k):
-        # Forward pass with perturbed embeddings
         outputs = model(
             inputs_embeds  = embeddings + delta,
             attention_mask = attention_mask,
             labels         = labels,
         )
-        # Normalize loss so gradient scale is consistent across K steps
         loss = outputs.loss / args.freelb_k
-
-        # Accumulate gradients into theta
-        # retain_graph because we need to backward again in next steps
         loss.backward(retain_graph=(step_k < args.freelb_k - 1))
         total_loss += loss.item()
 
         if step_k < args.freelb_k - 1:
-            # Gradient ascent on delta: move toward worst-case perturbation
             delta_grad = delta.grad.detach()
             delta = delta + args.freelb_alpha * delta_grad.sign()
-
-            # Project back onto Frobenius ball of radius eps
             delta_norm = delta.data.norm(p="fro")
             if delta_norm > args.freelb_eps:
                 delta = delta * (args.freelb_eps / delta_norm)
-
-            # Need requires_grad again after detach
             delta = delta.detach().requires_grad_(True)
 
     return total_loss
+
+
+def save_training_state(output_dir, optimizer, scheduler, epoch, best_val_acc):
+    """Save optimizer/scheduler state after each epoch for exact resume."""
+    state = {
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "last_completed_epoch": epoch,
+        "best_val_acc": best_val_acc,
+    }
+    path = os.path.join(output_dir, RESUME_STATE_FILE)
+    torch.save(state, path)
+    print(f"  [resume] State saved → {path}", flush=True)
+
+
+def load_training_state(output_dir, optimizer, scheduler):
+    path = os.path.join(output_dir, RESUME_STATE_FILE)
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"No training state at {path}. Run without --resume to start fresh."
+        )
+    state = torch.load(path, map_location="cpu")
+    optimizer.load_state_dict(state["optimizer_state_dict"])
+    scheduler.load_state_dict(state["scheduler_state_dict"])
+    start_epoch  = state["last_completed_epoch"] + 1
+    best_val_acc = state["best_val_acc"]
+    print(
+        f"  [resume] Loaded from {path}\n"
+        f"  [resume] Next epoch = {start_epoch + 1} | best_val_acc = {best_val_acc:.4f}",
+        flush=True,
+    )
+    return start_epoch, best_val_acc
 
 
 def train(args):
@@ -155,10 +156,12 @@ def train(args):
     print(f"Device: {device}", flush=True)
 
     if not args.no_wandb:
+        import wandb
         wandb.init(
             project="asat-research",
             name=f"freelb_{args.dataset}_seed{args.seed}",
             config=vars(args),
+            resume="allow",
         )
 
     splits, tokenizer = load_and_tokenize(
@@ -174,9 +177,15 @@ def train(args):
         splits["val"], batch_size=args.batch_size * 2
     )
 
-    model = AutoModelForSequenceClassification.from_pretrained(
-        args.model_name, num_labels=2
-    ).to(device)
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    if args.resume and os.path.exists(os.path.join(args.output_dir, "config.json")):
+        print(f"  [resume] Loading model from {args.output_dir}", flush=True)
+        model = AutoModelForSequenceClassification.from_pretrained(args.output_dir).to(device)
+    else:
+        model = AutoModelForSequenceClassification.from_pretrained(
+            args.model_name, num_labels=2
+        ).to(device)
 
     optimizer = AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
@@ -189,10 +198,19 @@ def train(args):
         num_training_steps=total_steps,
     )
 
+    start_epoch  = 0
     best_val_acc = 0.0
-    os.makedirs(args.output_dir, exist_ok=True)
+    if args.resume:
+        start_epoch, best_val_acc = load_training_state(args.output_dir, optimizer, scheduler)
+        if start_epoch >= args.num_epochs:
+            print(
+                f"Already completed {args.num_epochs} epoch(s). "
+                "Increase --num_epochs to continue.",
+                flush=True,
+            )
+            return best_val_acc
 
-    for epoch in range(args.num_epochs):
+    for epoch in range(start_epoch, args.num_epochs):
         model.train()
         total_loss = 0.0
 
@@ -202,7 +220,6 @@ def train(args):
             step_loss = freelb_step(model, batch, device, args)
             total_loss += step_loss
 
-            # Gradient clipping - more important here due to K-step accumulation
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             optimizer.step()
             scheduler.step()
@@ -216,6 +233,7 @@ def train(args):
                     flush=True,
                 )
                 if not args.no_wandb:
+                    import wandb
                     wandb.log({"train/loss": avg})
 
         val_acc, _, _ = evaluate(model, val_loader, device)
@@ -228,6 +246,7 @@ def train(args):
         print(f"{'='*60}\n", flush=True)
 
         if not args.no_wandb:
+            import wandb
             wandb.log({
                 "epoch": epoch + 1,
                 "train/avg_loss": avg_loss,
@@ -238,7 +257,9 @@ def train(args):
             best_val_acc = val_acc
             model.save_pretrained(args.output_dir)
             tokenizer.save_pretrained(args.output_dir)
-            print(f"Saved best model (val_acc={val_acc:.4f})", flush=True)
+            print(f"  Saved best model (val_acc={val_acc:.4f})", flush=True)
+
+        save_training_state(args.output_dir, optimizer, scheduler, epoch, best_val_acc)
 
     results = {
         "method": "freelb",
@@ -258,6 +279,7 @@ def train(args):
     print(f"Results saved to  : {path}", flush=True)
 
     if not args.no_wandb:
+        import wandb
         wandb.finish()
 
     return best_val_acc
