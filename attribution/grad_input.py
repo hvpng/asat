@@ -10,7 +10,7 @@
 #
 # Lưu ý PyTorch 2.x:
 #   scaled_dot_product_attention với mem_efficient backend KHÔNG hỗ trợ
-#   double backprop. Phải force math backend khi tính GI cho L_align.
+#   double backprop. Phải force MATH backend qua sdpa_kernel context manager.
 #
 # API:
 #   from attribution.grad_input import compute_grad_input
@@ -18,6 +18,7 @@
 #   # attr: Tensor [batch, seq_len, hidden_dim], có gradient → dùng được trong loss
 
 import torch
+from torch.nn.attention import sdpa_kernel, SDPBackend
 
 
 def compute_grad_input(model, embeddings, attention_mask, label):
@@ -46,14 +47,9 @@ def compute_grad_input(model, embeddings, attention_mask, label):
         "Tạo bằng: emb = embedding_layer(input_ids).requires_grad_(True)"
     )
 
-    # PyTorch 2.x dùng scaled_dot_product_attention với mem_efficient backend
-    # không hỗ trợ double backprop (create_graph=True).
-    # Phải force math backend để tính đạo hàm bậc hai qua L_align.
-    with torch.backends.cuda.sdp_kernel(
-        enable_flash=False,
-        enable_math=True,
-        enable_mem_efficient=False,
-    ):
+    # PyTorch 2.x: mem_efficient và flash attention backend không hỗ trợ
+    # double backprop (create_graph=True). Force MATH backend.
+    with sdpa_kernel(SDPBackend.MATH):
         outputs = model(inputs_embeds=embeddings, attention_mask=attention_mask)
 
     logits = outputs.logits  # [batch, num_labels]
