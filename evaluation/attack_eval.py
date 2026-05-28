@@ -77,10 +77,14 @@ def run_attack(attack_name, model, tokenizer, dataset_name, n_samples, seed):
 
     hf_name, hf_config, split, text_col, label_col = DATASET_MAP[dataset_name]
 
+    # Shuffle trước bằng datasets, sau đó wrap vào TextAttack
+    from datasets import load_dataset as hf_load
+    raw = hf_load(hf_name, hf_config) if hf_config else hf_load(hf_name)
+    ds  = raw[split].shuffle(seed=seed)
+
     ta_dataset = HuggingFaceDataset(
-        hf_name, hf_config, split=split,
+        ds,
         dataset_columns=(text_col, label_col),
-        shuffle=True, seed=seed,
     )
     wrapper = HuggingFaceModelWrapper(model, tokenizer)
 
@@ -244,7 +248,7 @@ def main():
         }, f, indent=2)
     print(f"\n  Results → {out_path}")
 
-    # ── 4. Vẽ heatmap (tuần 5–6: --visualize 10) ─────────────────────────
+    # ── 4. Vẽ heatmap ─────────────────────────
     if args.visualize > 0:
         from scipy.stats import spearmanr
         viz_dir = os.path.join(args.output_dir, f"ig_heatmaps_{ckpt_tag}_{args.attack}")
