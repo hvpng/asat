@@ -8,6 +8,10 @@
 #   - Tính đạo hàm theo cùng ground-truth label y (target-consistent).
 #   - Công thức: GI_i = ∂score_y/∂z_i ⊙ z_i  (Hadamard, per token per dim)
 #
+# Lưu ý PyTorch 2.x:
+#   scaled_dot_product_attention với mem_efficient backend KHÔNG hỗ trợ
+#   double backprop. Phải force math backend khi tính GI cho L_align.
+#
 # API:
 #   from attribution.grad_input import compute_grad_input
 #   attr = compute_grad_input(model, embeddings, attention_mask, label)
@@ -42,21 +46,29 @@ def compute_grad_input(model, embeddings, attention_mask, label):
         "Tạo bằng: emb = embedding_layer(input_ids).requires_grad_(True)"
     )
 
-    outputs = model(inputs_embeds=embeddings, attention_mask=attention_mask)
-    logits  = outputs.logits  # [batch, num_labels]
+    # PyTorch 2.x dùng scaled_dot_product_attention với mem_efficient backend
+    # không hỗ trợ double backprop (create_graph=True).
+    # Phải force math backend để tính đạo hàm bậc hai qua L_align.
+    with torch.backends.cuda.sdp_kernel(
+        enable_flash=False,
+        enable_math=True,
+        enable_mem_efficient=False,
+    ):
+        outputs = model(inputs_embeds=embeddings, attention_mask=attention_mask)
+
+    logits = outputs.logits  # [batch, num_labels]
 
     # Score của đúng class y cho từng sample trong batch
-    # gather: [batch, 1] → squeeze → [batch]
     scores = logits.gather(dim=1, index=label.unsqueeze(1)).squeeze(1)
-    score_sum = scores.sum()  # scalar để backward
+    score_sum = scores.sum()
 
     # Gradient của score_y theo embeddings
     # create_graph=True: giữ đồ thị cho double backprop qua L_align
     grads = torch.autograd.grad(
-        outputs     = score_sum,
-        inputs      = embeddings,
-        create_graph= True,   # BẮT BUỘC cho L_align.backward()
-        retain_graph= True,   # training loop cần backward thêm lần nữa
+        outputs      = score_sum,
+        inputs       = embeddings,
+        create_graph = True,   # BẮT BUỘC cho L_align.backward()
+        retain_graph = True,   # training loop cần backward thêm lần nữa
     )[0]  # [batch, seq_len, hidden_dim]
 
     gi = grads * embeddings  # Hadamard: ∂score/∂z ⊙ z
