@@ -1,4 +1,5 @@
 # evaluation/attack_eval.py
+# Orchestrator cho tuần 5–6 (và tái sử dụng mọi tuần sau).
 #
 # Nhiệm vụ:
 #   1. Load model + dataset
@@ -69,23 +70,22 @@ def run_attack(attack_name, model, tokenizer, dataset_name, n_samples, seed):
     Trả về list of dict:
         { original_text, attacked_text, label, pred_flipped }
     """
-    import textattack
     from textattack import Attacker, AttackArgs
     from textattack.datasets import HuggingFaceDataset
     from textattack.models.wrappers import HuggingFaceModelWrapper
     from textattack.attack_results import SuccessfulAttackResult
+    from datasets import load_dataset as hf_load
 
     hf_name, hf_config, split, text_col, label_col = DATASET_MAP[dataset_name]
 
-    # Shuffle trước bằng datasets, sau đó wrap vào TextAttack
-    from datasets import load_dataset as hf_load
+    # Load + shuffle trước bằng datasets (HuggingFaceDataset không nhận seed)
     raw = hf_load(hf_name, hf_config) if hf_config else hf_load(hf_name)
     ds  = raw[split].shuffle(seed=seed)
 
-    ta_dataset = HuggingFaceDataset(
-        ds,
-        dataset_columns=(text_col, label_col),
-    )
+    # Wrap vào TextAttack dataset
+    # dataset_columns: ([list of input cols], label_col)
+    ta_dataset = HuggingFaceDataset(ds, dataset_columns=([text_col], label_col))
+
     wrapper = HuggingFaceModelWrapper(model, tokenizer)
 
     if attack_name == "textfooler":
@@ -103,8 +103,8 @@ def run_attack(attack_name, model, tokenizer, dataset_name, n_samples, seed):
 
     records = []
     for res in raw_results:
-        orig = res.original_result.attacked_text.text
-        label = int(res.original_result.ground_truth_output)
+        orig    = res.original_result.attacked_text.text
+        label   = int(res.original_result.ground_truth_output)
         flipped = isinstance(res, SuccessfulAttackResult)
         attacked = res.perturbed_result.attacked_text.text if flipped else orig
         records.append({
@@ -123,11 +123,12 @@ def save_heatmap(tokens_c, attr_c, tokens_a, attr_a,
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import matplotlib as mpl
 
     fig, axes = plt.subplots(2, 1, figsize=(14, 3))
 
     def _draw(ax, tokens, attr, row_label, color):
-        non_pad = [i for i, t in enumerate(tokens) if t != "[PAD]"]
+        non_pad = [i for i, t in enumerate(tokens) if t not in ("[PAD]", "<pad>")]
         toks = [tokens[i] for i in non_pad]
         vals = attr[non_pad]
         vmax = max(np.abs(vals).max(), 1e-8)
@@ -136,7 +137,6 @@ def save_heatmap(tokens_c, attr_c, tokens_a, attr_a,
         ax.set_ylim(0, 1)
         ax.axis("off")
         ax.set_ylabel(row_label, rotation=0, labelpad=45, va="center", fontsize=8)
-        import matplotlib as mpl
         for i, (tok, v) in enumerate(zip(toks, norm)):
             alpha = min(abs(v), 1.0) * 0.85
             bg = (*mpl.colors.to_rgb(color), alpha)
@@ -148,7 +148,7 @@ def save_heatmap(tokens_c, attr_c, tokens_a, attr_a,
     _draw(axes[0], tokens_c, attr_c, "CLEAN",    "#1a73e8")
     _draw(axes[1], tokens_a, attr_a, "ATTACKED", "#e53935")
 
-    status = "FLIPPED ⚠" if pred_flipped else f"stable | ρ={rho:.3f}"
+    status = "FLIPPED " if pred_flipped else f"stable | ρ={rho:.3f}"
     fig.suptitle(f"[{idx}] label={label} | {status}", fontsize=9, fontweight="bold")
     plt.tight_layout()
 
@@ -188,14 +188,14 @@ def main():
 
     # ── 2. Tính IG cho từng cặp → S_adv ──────────────────────────────────
     print(f"\nComputing IG ({args.ig_steps} steps) for {n_total} pairs...")
-    attr_pairs = []
-    heatmap_data = []  # lưu lại để vẽ nếu cần
+    attr_pairs   = []
+    heatmap_data = []
 
     for i, rec in enumerate(records):
         if i % 50 == 0:
             print(f"  {i}/{n_total}", flush=True)
 
-        _, attr_c = compute_ig(
+        tokens_c, attr_c = compute_ig(
             model, tokenizer, rec["original_text"],
             rec["label"], device, args.max_length, args.ig_steps,
         )
@@ -211,15 +211,6 @@ def main():
         })
 
         if args.visualize > 0 and i < args.visualize:
-            tokens_c, _ = compute_ig.__wrapped__ if hasattr(compute_ig, "__wrapped__") \
-                else (None, None)
-            # re-compute tokens_c (đã có attr_c, chỉ cần tokens)
-            enc = tokenizer(rec["original_text"], return_tensors="pt",
-                            truncation=True, padding="max_length",
-                            max_length=args.max_length)
-            tokens_c = tokenizer.convert_ids_to_tokens(
-                enc["input_ids"].squeeze(0).tolist()
-            )
             heatmap_data.append((tokens_c, attr_c, tokens_a, attr_a, rec))
 
     s_adv, n_stable, rho_list = compute_s_adv(attr_pairs)
@@ -248,15 +239,19 @@ def main():
         }, f, indent=2)
     print(f"\n  Results → {out_path}")
 
-    # ── 4. Vẽ heatmap ─────────────────────────
-    if args.visualize > 0:
+    # ── 4. Vẽ heatmap (tuần 5–6: --visualize 10) ─────────────────────────
+    if args.visualize > 0 and heatmap_data:
         from scipy.stats import spearmanr
         viz_dir = os.path.join(args.output_dir, f"ig_heatmaps_{ckpt_tag}_{args.attack}")
         os.makedirs(viz_dir, exist_ok=True)
         print(f"\nSaving {len(heatmap_data)} heatmaps → {viz_dir}/")
 
         for idx, (tokens_c, attr_c, tokens_a, attr_a, rec) in enumerate(heatmap_data):
-            non_pad = next((i for i, t in enumerate(tokens_c) if t == "[PAD]"), len(tokens_c))
+            pad_tokens = ("[PAD]", "<pad>")
+            non_pad = next(
+                (i for i, t in enumerate(tokens_c) if t in pad_tokens),
+                len(tokens_c)
+            )
             rho = float("nan")
             if not rec["pred_flipped"] and non_pad > 1:
                 rho, _ = spearmanr(attr_c[:non_pad], attr_a[:non_pad])
