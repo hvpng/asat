@@ -76,7 +76,7 @@ def run_attack(attack_name, model, tokenizer, dataset_name, n_samples, seed):
     from textattack import Attacker, AttackArgs
     from textattack.datasets import HuggingFaceDataset
     from textattack.models.wrappers import HuggingFaceModelWrapper
-    from textattack.attack_results import SuccessfulAttackResult
+    from textattack.attack_results import SuccessfulAttackResult, FailedAttackResult
     from datasets import load_dataset as hf_load
 
     hf_name, hf_config, split, text_col, label_col = DATASET_MAP[dataset_name]
@@ -106,10 +106,23 @@ def run_attack(attack_name, model, tokenizer, dataset_name, n_samples, seed):
 
     records = []
     for res in raw_results:
-        orig    = res.original_result.attacked_text.text
-        label   = int(res.original_result.ground_truth_output)
-        flipped = isinstance(res, SuccessfulAttackResult)
-        attacked = res.perturbed_result.attacked_text.text if flipped else orig
+        orig  = res.original_result.attacked_text.text
+        label = int(res.original_result.ground_truth_output)
+
+        if isinstance(res, SuccessfulAttackResult):
+            # Attack thành công: pred bị flip, text đã bị thay đổi
+            attacked = res.perturbed_result.attacked_text.text
+            flipped  = True
+        elif isinstance(res, FailedAttackResult):
+            # Attack thất bại: pred giữ nguyên NHƯNG text đã bị perturb thực sự
+            # → label-stable + perturbed → dùng để tính S_adv
+            attacked = res.perturbed_result.attacked_text.text
+            flipped  = False
+        else:
+            # Skipped: model đã sai từ đầu, không có perturbed text hữu ích
+            attacked = orig
+            flipped  = False
+
         records.append({
             "original_text": orig,
             "attacked_text": attacked,
